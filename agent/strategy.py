@@ -1,10 +1,10 @@
 """agent/strategy.py — discovery, delegation, caching, replica, and budget
 POLICY. Where `agent/gateway.py` is the control plane (route / admit /
 authorize / budget — the four JOBS a decision must do), this file is the
-building blocks a real answer to those jobs is made of. Nothing here is
-wired into `Gateway.decide` by default — see agent/gateway.py's own module
-docstring and agent/README.md's table for where each piece is meant to
-plug in. That wiring is the assignment, not a step you're missing.
+building blocks a real answer to those jobs is made of. The gateway uses
+these helpers directly for cost estimation, adaptive pacing, narrow masks,
+deprecated successors, evidence-based replica selection, delegation rate
+windows, and safe result snapshots.
 
 THE ARITHMETIC THAT MAKES THIS FILE'S EXISTENCE THE LESSON
 ----------------------------------------------------------------------------
@@ -32,15 +32,10 @@ silently drift from the real cost table):
                  = 49 credits — MORE THAN ONE THIRD OF THE WHOLE DUEL'S
                    BUDGET, spent in a single round.
 
-Play at the DISCIPLINED CEILING (11 cr) every single round and 10 rounds
-costs 110 — a hair OVER the 100-credit pool: this file's own `__main__`
-demo shows that combination surviving nine full rounds and only running dry
-paying for the tenth. That is not a bug in the arithmetic; it is the honest
-point — "disciplined" is not a magic number, it is not re-paying for the
-same provenance read or the same frame body every round when you already
-have it (`ResultCache` below, and `BudgetPacer.is_affordable`'s reserve
-floor). Play CARELESS even once and you are mathematically bankrupt by
-round 3 (100 − 49 − 49 < 0) — not because the game is rigged against you,
+The current cost table prices that disciplined sequence at 9 credits, so
+ten rounds consume 90 and leave a real 10-credit contingency.  That margin
+still depends on narrow masks; play CARELESS twice and you are almost
+bankrupt before round 3 (100 − 49 − 49 = 2) — not because the game is rigged against you,
 but because `registry.list_servers` and `glossary.list_terms` were
 deliberately built so their DEFAULT field mask is their full, expensive
 dump (FINAL-PLAN.md section 4.1: "an audit showed `list_servers` and
@@ -95,6 +90,8 @@ __all__ = [
     "is_catalog_trap",
     "cheap_mask",
     "successor_of",
+    "round_allowance",
+    "estimated_cost",
     "BudgetPacer",
     "ReplicaChoice",
     "pick_replica",
@@ -104,12 +101,20 @@ __all__ = [
 
 ROUNDS_PER_DUEL = 10
 
+# Save more aggressively in the cheap opening rounds; credits prevent more
+# scaled damage late in a duel.  The values total 97, leaving a small
+# contingency while still permitting the normal locate+read sequence.
+ROUND_ALLOWANCES: Mapping[int, int] = {
+    1: 9, 2: 9, 3: 9, 4: 9, 5: 9,
+    6: 9, 7: 10, 8: 10, 9: 11, 10: 12,
+}
+
 # A pacing target, not a hard rule: if you have spent MORE than this
 # fraction of your remaining budget by the time you decide whether THIS
 # round's call is affordable, you are trending toward the careless curve
 # above, not the disciplined one. `BudgetPacer.is_affordable` below uses it
 # as its one, deliberately simple, heuristic.
-SAFE_STARTING_RESERVE = 0.5  # keep at least half the ORIGINAL pool as a floor
+SAFE_STARTING_RESERVE = 0.5  # opening reserve fraction; is_affordable decays it by round
 
 # The two named "punishment button" tools (FINAL-PLAN.md 4.1): their
 # DEFAULT field mask is their full, most expensive dump, not a cheap
@@ -190,6 +195,31 @@ def successor_of(server: str, tool: str) -> tuple[str, str] | None:
     return DEPRECATED_SUCCESSORS.get((server, tool))
 
 
+def round_allowance(round_no: int) -> int:
+    """Return the deterministic spend target for one duel round."""
+    if not isinstance(round_no, int) or isinstance(round_no, bool):
+        return 8
+    return ROUND_ALLOWANCES.get(min(max(round_no, 1), ROUNDS_PER_DUEL), 8)
+
+
+def estimated_cost(
+    server: str,
+    tool: str,
+    fields: tuple[str, ...] = (),
+    *,
+    n_rows: int = 1,
+) -> int | None:
+    """Best-effort, side-effect-free price estimate.
+
+    ``None`` means the pair or mask is not in the authoritative cost table;
+    a gateway should deny that call instead of guessing a zero price.
+    """
+    try:
+        return _spec_cost(server, tool, fields=fields, n_rows=max(0, int(n_rows)))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 @dataclass
 class BudgetPacer:
     """Tracks YOUR OWN running spend across a duel and answers one
@@ -233,7 +263,12 @@ class BudgetPacer:
         as rounds run out will end up over-cautious late, not over-spent —
         the safer of the two failure directions, but still a real
         one-line simplification worth outgrowing."""
-        floor = self.starting_pool * reserve
+        if not isinstance(cost, int) or isinstance(cost, bool) or cost < 0:
+            return False
+        # The flat 50-credit floor is useful early and needlessly prevents
+        # completing late rounds.  Decay it linearly to zero over the duel.
+        rounds_left = max(0, self.rounds_total - max(1, round_no))
+        floor = self.starting_pool * reserve * (rounds_left / max(1, self.rounds_total - 1))
         return (self.credits_left - cost) >= floor
 
     def bankrupt_by(self) -> int | None:
@@ -256,7 +291,14 @@ class ReplicaChoice:
     reason: str
 
 
-def pick_replica(*, path_id: str | None, known_drifting: bool, prefers_fresh: bool = True) -> ReplicaChoice:
+def pick_replica(
+    *,
+    path_id: str | None,
+    known_drifting: bool,
+    prefers_fresh: bool = True,
+    requested_replica: str | None = None,
+    fresher_replica: str | None = None,
+) -> ReplicaChoice:
     """A starting heuristic for JOB 1 (ROUTE) in `agent/gateway.py`: which
     replica header (`mcp-replica: w|c`) to prefer when nothing else is
     known.
@@ -265,27 +307,27 @@ def pick_replica(*, path_id: str | None, known_drifting: bool, prefers_fresh: bo
     function derives — a real implementation reads it from a
     `registry.provenance` call or from drift knowledge your agent has
     accumulated this duel, never invents it. `path_id` is accepted (and
-    logged in `reason`) purely for traceability; this starter heuristic
-    does not branch on its value.
+    logged in `reason`) purely for traceability; path ids are never used as
+    memorised answers or as an unsupported freshness shortcut.
 
-    STARTER HEURISTIC, DELIBERATELY THIN: prefer "w" (working) when nothing
-    is known to be wrong with it — the working copy is what students
-    actually edit and re-render most recently, so it is the better default
-    guess absent evidence either way. When `known_drifting` is True AND
-    `prefers_fresh` is True, prefer "c" (canonical) instead, on the
-    assumption that a flagged drift means the working copy is the one that
-    diverged. THIS ASSUMPTION IS OFTEN WRONG — CORPUS-FACTS.md section 2's
-    own worked case (day18: 45 working frames vs 31 canonical) shows the
-    working copy can be the MORE complete one, not the stale one; "which
-    replica is actually fresher" needs a real signal (a `current_version_of`
-    ask, or a `registry.provenance` timestamp), not a coin flip on which
-    letter comes first. That real signal is exactly what this starter does
-    not have wired in — build it before you trust this function under a
-    live `replica_flip` attack."""
+    An explicit provenance signal wins, followed by the replica encoded in
+    the requested anchor. Merely knowing that two replicas drift never makes
+    either one fresher; without evidence this helper uses the working default
+    but labels freshness unresolved instead of inventing a canonical win."""
+    if fresher_replica in ("w", "c"):
+        return ReplicaChoice(
+            replica=fresher_replica,
+            reason=f"path_id={path_id!r}: provenance identifies {fresher_replica!r} as fresher",
+        )
+    if requested_replica in ("w", "c"):
+        return ReplicaChoice(
+            replica=requested_replica,
+            reason=f"path_id={path_id!r}: preserving the replica encoded by the requested anchor",
+        )
     if known_drifting and prefers_fresh:
         return ReplicaChoice(
-            replica="c",
-            reason=f"path_id={path_id!r} is known to drift this duel; preferring canonical as the naive fresher guess",
+            replica="w",
+            reason=f"path_id={path_id!r} drifts, but no observation proves which replica is fresher; using the neutral working default",
         )
     return ReplicaChoice(replica="w", reason=f"path_id={path_id!r}: no known drift; default to working")
 
@@ -307,10 +349,9 @@ class ResultCache:
     doubt it. A cache that is trusted blindly is exactly how a `stale_read`
     (CONTRACTS.md 6.4) happens for free.
 
-    Keys are `(anchor, tuple(sorted(fields)))` — the SAME anchor requested
-    with a NARROWER mask than what's cached is still a genuine cache miss
-    (you never paid for the field you'd be citing), which is why the key
-    includes the mask, not just the anchor."""
+    Keys are `(anchor, tuple(sorted(fields)))`. A cached superset safely
+    satisfies a narrower request; asking for any field outside the cached
+    mask is a genuine miss because that field was never observed."""
 
     _store: dict[tuple[str, tuple[str, ...]], Mapping[str, Any]] = field(default_factory=dict)
 
@@ -319,10 +360,29 @@ class ResultCache:
         return (anchor, tuple(sorted(fields)))
 
     def get(self, anchor: str, fields: tuple[str, ...]) -> Mapping[str, Any] | None:
-        return self._store.get(self._key(anchor, fields))
+        wanted = frozenset(fields)
+        exact = self._store.get(self._key(anchor, fields))
+        if exact is not None:
+            return exact
+        # A previously paid-for superset safely satisfies a narrower read.
+        candidates = [
+            (len(cached_fields), row)
+            for (cached_anchor, cached_fields), row in self._store.items()
+            if cached_anchor == anchor and wanted <= frozenset(cached_fields)
+        ]
+        return min(candidates, key=lambda item: item[0])[1] if candidates else None
 
     def put(self, anchor: str, fields: tuple[str, ...], row: Mapping[str, Any]) -> None:
         self._store[self._key(anchor, fields)] = dict(row)
+
+    def invalidate(self, anchor: str | None = None) -> None:
+        """Drop one anchor's snapshots, or the whole cache when omitted."""
+        if anchor is None:
+            self._store.clear()
+            return
+        for key in tuple(self._store):
+            if key[0] == anchor:
+                del self._store[key]
 
     def __len__(self) -> int:
         return len(self._store)
@@ -396,7 +456,7 @@ if __name__ == "__main__":
     assert succ == ("slides", "query")
     assert successor_of("slides", "query") is None
 
-    print("\n=== BudgetPacer: disciplined-at-the-CEILING barely lasts the duel; careless does not ===\n")
+    print("\n=== BudgetPacer: disciplined play leaves headroom; careless play does not ===\n")
     disciplined_pacer = BudgetPacer()
     for round_no in range(1, ROUNDS_PER_DUEL + 1):
         disciplined_pacer.record_spend(round_no, disciplined)
@@ -404,13 +464,8 @@ if __name__ == "__main__":
         f"  disciplined (ceiling, {disciplined}cr) x10 rounds -> spent={disciplined_pacer.credits_spent} "
         f"credits_left={disciplined_pacer.credits_left} bankrupt_by={disciplined_pacer.bankrupt_by()}"
     )
-    # Even the CEILING of "disciplined" (paying full price for query + get_frame
-    # + provenance, EVERY round, with no caching at all) survives nine full
-    # rounds and only runs dry paying for the tenth -- a sharp contrast with
-    # careless play below, and the honest reason ResultCache/pacing exist:
-    # not needing all three calls every round is what buys the margin
-    # FINAL-PLAN.md 4.3 calls "sustainable".
-    assert disciplined_pacer.bankrupt_by() == ROUNDS_PER_DUEL, disciplined_pacer.bankrupt_by()
+    assert disciplined_pacer.bankrupt_by() is None
+    assert disciplined_pacer.credits_left == 10
     nine_rounds_pacer = BudgetPacer()
     for round_no in range(1, ROUNDS_PER_DUEL):  # 9 rounds, not 10
         nine_rounds_pacer.record_spend(round_no, disciplined)
@@ -435,17 +490,22 @@ if __name__ == "__main__":
     mid_pacer.record_spend(1, 60)
     print(f"  after spending 60/100, credits_left={mid_pacer.credits_left}")
     assert mid_pacer.is_affordable(2, 5) is False  # would drop below the 50-credit reserve floor
-    assert mid_pacer.is_affordable(2, -20) is True  # nonsense cost, but arithmetic still holds
+    assert mid_pacer.is_affordable(2, -20) is False
     fresh_pacer = BudgetPacer()
     assert fresh_pacer.is_affordable(1, disciplined) is True
 
-    print("\n=== pick_replica: the naive heuristic, and why it is naive ===\n")
+    print("\n=== pick_replica: evidence wins; drift alone proves no winner ===\n")
     choice_clean = pick_replica(path_id="d8f95a7b", known_drifting=False)
     choice_drifting = pick_replica(path_id="d8f95a7b", known_drifting=True)
     print(f"  known_drifting=False -> {choice_clean}")
     print(f"  known_drifting=True  -> {choice_drifting}")
     assert choice_clean.replica == "w"
-    assert choice_drifting.replica == "c"
+    assert choice_drifting.replica == "w"
+    assert "no observation" in choice_drifting.reason
+    observed_fresher = pick_replica(
+        path_id="d8f95a7b", known_drifting=True, fresher_replica="c"
+    )
+    assert observed_fresher.replica == "c"
 
     print("\n=== ResultCache: same (anchor, fields) is a hit; a wider mask is a genuine miss ===\n")
     cache = ResultCache()

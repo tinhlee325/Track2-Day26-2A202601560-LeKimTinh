@@ -5,10 +5,10 @@ classes (CONTRACTS.md section 6.1) each one can save you from.
 
     gateway.py      the control plane: Gateway.decide(cmd) -> Decision
                      (CONTRACTS.md section 4, exactly)
-    strategy.py      discovery / delegation / caching / replica / budget
-                     policy — building blocks, not wired in by default
-    guardrails.py    grounding (real), injection/redaction/arithmetic
-                     (named stubs), abstention (real, naive)
+    strategy.py      integrated discovery / delegation / cache / replica /
+                     adaptive budget policy
+    guardrails.py    grounding, injection, redaction, numeric precision,
+                     and multi-signal abstention
     telemetry.py     ctx.emit wrappers — your own side only, never scored
     prompt.md        the system prompt LAYERED ON TOP of kit.loop.prompt's
                      harness prompt (not a replacement for it)
@@ -48,6 +48,8 @@ from agent.strategy import (
     careless_round_cost,
     is_catalog_trap,
     pick_replica,
+    round_allowance,
+    estimated_cost,
     should_delegate,
     successor_of,
 )
@@ -78,6 +80,8 @@ __all__ = [
     "careless_round_cost",
     "is_catalog_trap",
     "pick_replica",
+    "round_allowance",
+    "estimated_cost",
     "should_delegate",
     "successor_of",
     # telemetry.py
